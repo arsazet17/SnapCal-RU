@@ -1,0 +1,718 @@
+package com.ghostwan.snapcal.presentation.home
+
+import android.Manifest
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.speech.RecognizerIntent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.ClickableText
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
+import coil.compose.rememberAsyncImagePainter
+import coil.request.ImageRequest
+import com.ghostwan.snapcal.R
+import com.ghostwan.snapcal.data.remote.GeminiApiService
+import com.ghostwan.snapcal.domain.model.MealEntry
+import com.ghostwan.snapcal.presentation.FoodAnalysisViewModel
+import com.ghostwan.snapcal.presentation.FoodAnalysisViewModel.Companion.FREE_DAILY_LIMIT
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.Color
+import com.google.mlkit.vision.barcode.common.Barcode
+import org.json.JSONArray
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import java.io.File
+import java.util.Locale
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HomeScreen(
+    viewModel: FoodAnalysisViewModel,
+    onAnalysisStarted: () -> Unit,
+    favorites: List<MealEntry> = emptyList(),
+    onQuickAddFavorite: (MealEntry) -> Unit = {},
+    onMealClick: (MealEntry) -> Unit = {}
+) {
+    val context = LocalContext.current
+    var photoUri by remember { mutableStateOf<Uri?>(null) }
+    var photoVersion by remember { mutableIntStateOf(0) }
+    var foodDescription by remember { mutableStateOf("") }
+    var showApiKeyDialog by remember { mutableStateOf(false) }
+    var showQuotaWarning by remember { mutableStateOf(false) }
+    var apiKey by remember { mutableStateOf(viewModel.getApiKey()) }
+    var geminiModel by remember { mutableStateOf(viewModel.getGeminiModel()) }
+    val analysisEnabled = apiKey.isNotBlank()
+    var pendingTextAnalysis by remember { mutableStateOf(false) }
+    val scanRunningInBackground by viewModel.scanRunningInBackground.collectAsState()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(scanRunningInBackground) {
+        if (!scanRunningInBackground) return@LaunchedEffect
+        snackbarHostState.showSnackbar(context.getString(R.string.home_scan_background_started))
+    }
+
+    val imageFile = remember {
+        File(File(context.cacheDir, "images").apply { mkdirs() }, "food_photo.jpg")
+    }
+
+    val fileProviderUri = remember {
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            imageFile
+        )
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { success ->
+        if (success) {
+            photoVersion++
+            photoUri = fileProviderUri
+        }
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            photoUri = uri
+        }
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            try {
+                cameraLauncher.launch(fileProviderUri)
+            } catch (_: android.content.ActivityNotFoundException) {
+                android.widget.Toast.makeText(context, context.getString(R.string.camera_unavailable), android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    val speechLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val matches = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            if (!matches.isNullOrEmpty()) {
+                foodDescription = matches[0]
+            }
+        }
+    }
+
+    if (showQuotaWarning) {
+        QuotaWarningDialog(
+            dailyCount = viewModel.getDailyRequestCount(),
+            dailyLimit = FREE_DAILY_LIMIT,
+            onConfirm = {
+                showQuotaWarning = false
+                viewModel.resetState()
+                if (pendingTextAnalysis) {
+                    viewModel.analyzeFoodFromText(foodDescription)
+                    scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.home_analysis_started)) }
+                    pendingTextAnalysis = false
+                    onAnalysisStarted()
+                } else {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    viewModel.startImageScan(context, photoUri!!)
+                    photoUri = null
+                }
+            },
+            onDismiss = {
+                showQuotaWarning = false
+                pendingTextAnalysis = false
+            }
+        )
+    }
+
+    if (showApiKeyDialog) {
+        ApiKeyDialog(
+            currentKey = apiKey,
+            currentModel = geminiModel,
+            onDismiss = { showApiKeyDialog = false },
+            onConfirm = { key, model ->
+                apiKey = key
+                geminiModel = model
+                viewModel.setGeminiSettings(key, model)
+                scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.settings_saved)) }
+                showApiKeyDialog = false
+            }
+        )
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.app_name)) },
+                actions = {
+                    IconButton(onClick = { showApiKeyDialog = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.settings_description))
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(vertical = 16.dp)
+        ) {
+            item {
+                Text(
+                    text = stringResource(R.string.home_description),
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            }
+
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp)
+                ) {
+                    if (photoUri != null) {
+                        Image(
+                            painter = rememberAsyncImagePainter(
+                                ImageRequest.Builder(context)
+                                    .data(photoUri)
+                                    .memoryCacheKey("${photoUri}_${photoVersion}")
+                                    .diskCacheKey("${photoUri}_${photoVersion}")
+                                    .build()
+                            ),
+                            contentDescription = stringResource(R.string.home_photo_description),
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    Icons.Default.CameraAlt,
+                                    contentDescription = null,
+                                    modifier = Modifier.height(48.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = stringResource(R.string.home_no_photo),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            permissionLauncher.launch(Manifest.permission.CAMERA)
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.CameraAlt, contentDescription = null)
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text(stringResource(R.string.home_button_photo))
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            galleryLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.PhotoLibrary, contentDescription = null)
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text(stringResource(R.string.home_button_gallery))
+                    }
+                }
+            }
+
+            if (photoUri != null) {
+                item {
+                    Button(
+                        onClick = {
+                            if (viewModel.isQuotaExceeded()) {
+                                showQuotaWarning = true
+                            } else {
+                                viewModel.resetState()
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                }
+                                viewModel.startImageScan(context, photoUri!!)
+                                photoUri = null
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = analysisEnabled
+                    ) {
+                        Text(stringResource(R.string.home_button_analyze))
+                    }
+                }
+            }
+
+            // Text/voice input section
+            item {
+                Text(
+                    text = stringResource(R.string.home_or_describe),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            item {
+                OutlinedTextField(
+                    value = foodDescription,
+                    onValueChange = { foodDescription = it },
+                    label = { Text(stringResource(R.string.home_text_hint)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    maxLines = 3,
+                    trailingIcon = {
+                        Row {
+                            IconButton(onClick = {
+                                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                                    putExtra(RecognizerIntent.EXTRA_PROMPT, context.getString(R.string.home_voice_prompt))
+                                }
+                                try {
+                        speechLauncher.launch(intent)
+                    } catch (_: android.content.ActivityNotFoundException) {
+                        android.widget.Toast.makeText(context, context.getString(R.string.voice_unavailable), android.widget.Toast.LENGTH_LONG).show()
+                    }
+                            }) {
+                                Icon(
+                                    Icons.Default.Mic,
+                                    contentDescription = stringResource(R.string.home_button_voice),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+                )
+            }
+
+            if (foodDescription.isNotBlank()) {
+                item {
+                    Button(
+                        onClick = {
+                            if (viewModel.isQuotaExceeded()) {
+                                pendingTextAnalysis = true
+                                showQuotaWarning = true
+                            } else {
+                                viewModel.resetState()
+                                viewModel.analyzeFoodFromText(foodDescription)
+                                scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.home_analysis_started)) }
+                                onAnalysisStarted()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = analysisEnabled
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null)
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text(stringResource(R.string.home_button_analyze_text))
+                    }
+                }
+            }
+
+            // Barcode scanner section
+            item {
+                Text(
+                    text = stringResource(R.string.home_or_scan_barcode),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            item {
+                OutlinedButton(
+                    onClick = {
+                        val options = GmsBarcodeScannerOptions.Builder()
+                            .setBarcodeFormats(
+                                Barcode.FORMAT_EAN_13,
+                                Barcode.FORMAT_EAN_8,
+                                Barcode.FORMAT_UPC_A,
+                                Barcode.FORMAT_UPC_E
+                            )
+                            .build()
+                        val scanner = GmsBarcodeScanning.getClient(context, options)
+                        scanner.startScan()
+                            .addOnSuccessListener { barcode ->
+                                barcode.rawValue?.let { value ->
+                                    viewModel.resetState()
+                                    viewModel.analyzeFoodFromBarcode(value)
+                                    scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.home_barcode_searching)) }
+                                    onAnalysisStarted()
+                                }
+                            }
+                            .addOnFailureListener {
+                                android.widget.Toast.makeText(context, context.getString(R.string.barcode_failed), android.widget.Toast.LENGTH_LONG).show()
+                            }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.QrCodeScanner, contentDescription = null)
+                    Spacer(modifier = Modifier.padding(4.dp))
+                    Text(stringResource(R.string.home_button_barcode))
+                }
+            }
+
+            if (!analysisEnabled) {
+                item {
+                    Text(
+                        text = stringResource(R.string.home_api_key_warning),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+
+            // Favorites section
+            if (favorites.isNotEmpty()) {
+                item {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    Text(
+                        text = stringResource(R.string.dashboard_favorites),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                items(favorites) { meal ->
+                    FavoriteCard(
+                        meal = meal,
+                        onQuickAdd = { onQuickAddFavorite(meal) },
+                        onClick = { onMealClick(meal) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ApiKeyDialog(
+    currentKey: String,
+    currentModel: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String, String) -> Unit
+) {
+    var key by remember { mutableStateOf(currentKey) }
+    var keyError by remember { mutableStateOf(false) }
+    var model by remember { mutableStateOf(currentModel) }
+    val uriHandler = LocalUriHandler.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.dialog_api_key_title)) },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Text(
+                    stringResource(R.string.dialog_api_key_message),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                val linkText = stringResource(R.string.dialog_api_key_link)
+                val annotatedString = buildAnnotatedString {
+                    pushStringAnnotation(tag = "URL", annotation = "https://aistudio.google.com/apikey")
+                    withStyle(style = SpanStyle(
+                        color = MaterialTheme.colorScheme.primary,
+                        textDecoration = TextDecoration.Underline
+                    )) {
+                        append(linkText)
+                    }
+                    pop()
+                }
+                ClickableText(
+                    text = annotatedString,
+                    style = MaterialTheme.typography.bodyMedium,
+                    onClick = { offset ->
+                        annotatedString.getStringAnnotations(tag = "URL", start = offset, end = offset)
+                            .firstOrNull()?.let { annotation ->
+                                uriHandler.openUri(annotation.item)
+                            }
+                    }
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = key,
+                    onValueChange = { key = it; keyError = false },
+                    label = { Text(stringResource(R.string.dialog_api_key_label)) },
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
+                    isError = keyError || !com.ghostwan.snapcal.data.local.ApiKeyStore.isValid(key),
+                    supportingText = {
+                        if (keyError) Text(stringResource(R.string.api_key_storage_error))
+                        else if (!com.ghostwan.snapcal.data.local.ApiKeyStore.isValid(key)) Text(stringResource(R.string.api_key_invalid))
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (currentKey.isNotBlank()) {
+                    TextButton(onClick = { key = "" }) { Text(stringResource(R.string.api_key_remove)) }
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+                GeminiModelSelector(
+                    selected = model,
+                    onSelect = { model = it }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = com.ghostwan.snapcal.data.local.ApiKeyStore.isValid(key),
+                onClick = {
+                    try { onConfirm(key.trim(), model) } catch (_: Exception) { keyError = true }
+                }
+            ) {
+                Text(stringResource(R.string.dialog_button_save))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.dialog_button_cancel))
+            }
+        }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GeminiModelSelector(selected: String, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = selected,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(stringResource(R.string.profile_ai_model_label)) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier.fillMaxWidth().menuAnchor()
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            GeminiApiService.AVAILABLE_MODELS.forEach { availableModel ->
+                DropdownMenuItem(
+                    text = { Text(availableModel) },
+                    onClick = {
+                        onSelect(availableModel)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuotaWarningDialog(
+    dailyCount: Int,
+    dailyLimit: Int,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.quota_warning_title)) },
+        text = {
+            Text(
+                stringResource(R.string.quota_warning_message, dailyCount, dailyLimit),
+                style = MaterialTheme.typography.bodyMedium
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(stringResource(R.string.quota_warning_continue))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.dialog_button_cancel))
+            }
+        }
+    )
+}
+
+@Composable
+private fun FavoriteCard(meal: MealEntry, onQuickAdd: () -> Unit, onClick: () -> Unit) {
+    val healthColor = remember(meal.ingredientsJson) {
+        computeHealthColor(meal.ingredientsJson)
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        onClick = onClick
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(IntrinsicSize.Min),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (healthColor != null) {
+                Box(
+                    modifier = Modifier
+                        .width(4.dp)
+                        .fillMaxHeight()
+                        .background(healthColor, RoundedCornerShape(topStart = 12.dp, bottomStart = 12.dp))
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = meal.emoji ?: "\uD83C\uDF7D\uFE0F",
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(end = 12.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = meal.dishName,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        text = stringResource(R.string.result_kcal, meal.calories),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                IconButton(onClick = onQuickAdd) {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = stringResource(R.string.dashboard_add_favorite),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun computeHealthColor(ingredientsJson: String): Color? {
+    return try {
+        val array = JSONArray(ingredientsJson)
+        val scores = mutableListOf<Int>()
+        for (i in 0 until array.length()) {
+            val obj = array.getJSONObject(i)
+            if (obj.has("healthRating") && !obj.isNull("healthRating")) {
+                scores.add(when (obj.getString("healthRating")) {
+                    "healthy" -> 2
+                    "moderate" -> 1
+                    else -> 0
+                })
+            }
+        }
+        if (scores.isEmpty()) return null
+        val avg = scores.average()
+        when {
+            avg >= 1.5 -> Color(0xFF4CAF50)
+            avg >= 0.75 -> Color(0xFFFF9800)
+            else -> Color(0xFFF44336)
+        }
+    } catch (_: Exception) {
+        null
+    }
+}

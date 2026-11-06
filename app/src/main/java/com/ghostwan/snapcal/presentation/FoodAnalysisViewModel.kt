@@ -1,0 +1,660 @@
+package com.ghostwan.snapcal.presentation
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.app.PendingIntent
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.ghostwan.snapcal.MainActivity
+import com.ghostwan.snapcal.R
+import com.ghostwan.snapcal.SnapCalApp
+import com.ghostwan.snapcal.domain.model.FoodAnalysis
+import com.ghostwan.snapcal.domain.model.Ingredient
+import com.ghostwan.snapcal.domain.model.Macros
+import com.ghostwan.snapcal.domain.model.MealEntry
+import com.ghostwan.snapcal.domain.repository.MealRepository
+import com.ghostwan.snapcal.domain.repository.SettingsRepository
+import com.ghostwan.snapcal.domain.repository.UsageRepository
+import com.ghostwan.snapcal.domain.usecase.AnalyzeFoodUseCase
+import com.ghostwan.snapcal.domain.usecase.CorrectAnalysisUseCase
+import com.ghostwan.snapcal.domain.usecase.SaveMealUseCase
+import com.ghostwan.snapcal.presentation.model.AnalysisUiState
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import java.io.ByteArrayOutputStream
+import java.util.Locale
+
+class FoodAnalysisViewModel(
+    private val analyzeFoodUseCase: AnalyzeFoodUseCase,
+    private val correctAnalysisUseCase: CorrectAnalysisUseCase,
+    private val settingsRepository: SettingsRepository,
+    private val usageRepository: UsageRepository,
+    private val saveMealUseCase: SaveMealUseCase,
+    private val mealRepository: MealRepository
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow<AnalysisUiState>(AnalysisUiState.Idle)
+    val uiState: StateFlow<AnalysisUiState> = _uiState
+
+    private val _mealSaved = MutableStateFlow(false)
+    val mealSaved: StateFlow<Boolean> = _mealSaved
+
+    private val _saveError = MutableStateFlow<String?>(null)
+    val saveError: StateFlow<String?> = _saveError
+
+    private val _scanRunningInBackground = MutableStateFlow(false)
+    val scanRunningInBackground: StateFlow<Boolean> = _scanRunningInBackground
+
+    private val _readOnly = MutableStateFlow(false)
+    val readOnly: StateFlow<Boolean> = _readOnly
+
+    private val _isFavorite = MutableStateFlow(false)
+    val isFavorite: StateFlow<Boolean> = _isFavorite
+
+    private val _quantity = MutableStateFlow(1)
+    val quantity: StateFlow<Int> = _quantity
+
+    private val _recentEmojis = MutableStateFlow<List<String>>(emptyList())
+    val recentEmojis: StateFlow<List<String>> = _recentEmojis
+
+    private var lastImageData: ByteArray? = null
+    private var editingMealId: Long? = null
+    private var editingMealIds: List<Long>? = null
+    private var editingMealDate: String? = null
+    private var targetDate: String? = null
+
+    init {
+        loadRecentEmojis()
+    }
+
+    fun setTargetDate(date: String?) {
+        targetDate = date
+    }
+
+    private fun loadRecentEmojis() {
+        viewModelScope.launch {
+            _recentEmojis.value = mealRepository.getRecentEmojis()
+        }
+    }
+
+    fun getApiKey(): String = settingsRepository.getApiKey()
+
+    fun getGeminiModel(): String = settingsRepository.getGeminiModel()
+
+    fun setGeminiSettings(key: String, model: String) {
+        settingsRepository.setApiKey(key)
+        settingsRepository.setGeminiModel(model)
+    }
+
+    fun isQuotaExceeded(): Boolean =
+        usageRepository.getDailyRequestCount() >= FREE_DAILY_LIMIT
+
+    fun getDailyRequestCount(): Int =
+        usageRepository.getDailyRequestCount()
+
+    fun analyzeFood(context: Context, imageUri: Uri) {
+        viewModelScope.launch {
+            _uiState.value = AnalysisUiState.Loading
+            try {
+                val imageData = readAndCompressImage(context, imageUri)
+                lastImageData = imageData
+                val language = "Russian (русский язык)"
+                val result = analyzeFoodUseCase(imageData, language)
+                usageRepository.recordRequest()
+                _uiState.value = AnalysisUiState.Success(result)
+            } catch (e: Exception) {
+                _uiState.value = AnalysisUiState.Error(
+                    e.russianMessage()
+                )
+            }
+        }
+    }
+
+    fun startImageScan(context: Context, imageUri: Uri) {
+        viewModelScope.launch {
+            _scanRunningInBackground.value = true
+            _uiState.value = AnalysisUiState.Loading
+            try {
+                val imageData = readAndCompressImage(context, imageUri)
+                lastImageData = imageData
+                val language = "Russian (русский язык)"
+                val result = analyzeFoodUseCase(imageData, language)
+                usageRepository.recordRequest()
+                _uiState.value = AnalysisUiState.Success(result)
+                postScanFinishedNotification(context, result)
+            } catch (e: Exception) {
+                _uiState.value = AnalysisUiState.Error(
+                    e.russianMessage()
+                )
+                postScanFailedNotification(context)
+            } finally {
+                _scanRunningInBackground.value = false
+            }
+        }
+    }
+
+    fun analyzeFoodFromText(description: String) {
+        viewModelScope.launch {
+            _uiState.value = AnalysisUiState.Loading
+            try {
+                val language = "Russian (русский язык)"
+                val result = analyzeFoodUseCase.fromText(description, language)
+                usageRepository.recordRequest()
+                _uiState.value = AnalysisUiState.Success(result)
+            } catch (e: Exception) {
+                _uiState.value = AnalysisUiState.Error(
+                    e.russianMessage()
+                )
+            }
+        }
+    }
+
+    fun analyzeFoodFromBarcode(barcode: String) {
+        viewModelScope.launch {
+            _uiState.value = AnalysisUiState.Loading
+            try {
+                val result = analyzeFoodUseCase.fromBarcode(barcode)
+                _uiState.value = AnalysisUiState.Success(result)
+            } catch (e: Exception) {
+                _uiState.value = AnalysisUiState.Error(
+                    e.russianMessage()
+                )
+            }
+        }
+    }
+
+    fun correctAnalysis(originalAnalysis: FoodAnalysis, feedback: String) {
+        viewModelScope.launch {
+            _uiState.value = AnalysisUiState.Loading
+            _mealSaved.value = false
+            _readOnly.value = false
+            try {
+                val language = "Russian (русский язык)"
+                val corrected = correctAnalysisUseCase(
+                    originalAnalysis, feedback, lastImageData, language
+                )
+                usageRepository.recordRequest()
+                _uiState.value = AnalysisUiState.Success(corrected)
+            } catch (e: Exception) {
+                _uiState.value = AnalysisUiState.Success(originalAnalysis)
+                _saveError.value = e.russianMessage()
+            }
+        }
+    }
+
+    fun saveMeal(analysis: FoodAnalysis) {
+        viewModelScope.launch {
+            try {
+                val qty = _quantity.value
+                val mealIds = editingMealIds
+                val mealId = editingMealId
+                val mealDate = editingMealDate
+                if (mealIds != null && mealDate != null) {
+                    saveMealUseCase.replaceMultipleAndSave(mealIds, analysis, mealDate, qty)
+                } else if (mealId != null && mealDate != null) {
+                    saveMealUseCase.replaceAndSave(mealId, analysis, mealDate, qty)
+                } else {
+                    saveMealUseCase(analysis, qty, targetDate)
+                }
+                _mealSaved.value = true
+                loadRecentEmojis()
+            } catch (e: Exception) {
+                _saveError.value = e.russianMessage()
+            }
+        }
+    }
+
+    fun splitMeal(originalAnalysis: FoodAnalysis, meal2IngredientIndices: Set<Int>) {
+        viewModelScope.launch {
+            try {
+                val allIngredients = originalAnalysis.ingredients
+                val meal1Ingredients = allIngredients.filterIndexed { index, _ -> index !in meal2IngredientIndices }
+                val meal2Ingredients = allIngredients.filterIndexed { index, _ -> index in meal2IngredientIndices }
+
+                val meal1Calories = meal1Ingredients.sumOf { it.calories }
+                val meal2Calories = meal2Ingredients.sumOf { it.calories }
+                val totalCalories = originalAnalysis.totalCalories
+
+                val analysis1 = FoodAnalysis(
+                    dishName = if (meal1Ingredients.size == 1) meal1Ingredients[0].name
+                               else originalAnalysis.dishName,
+                    totalCalories = meal1Calories,
+                    ingredients = meal1Ingredients,
+                    macros = scaleMacros(originalAnalysis.macros, totalCalories, meal1Calories),
+                    notes = originalAnalysis.notes,
+                    emoji = originalAnalysis.emoji
+                )
+
+                val analysis2 = FoodAnalysis(
+                    dishName = if (meal2Ingredients.size == 1) meal2Ingredients[0].name
+                               else meal2Ingredients.joinToString(" + ") { it.name },
+                    totalCalories = meal2Calories,
+                    ingredients = meal2Ingredients,
+                    macros = scaleMacros(originalAnalysis.macros, totalCalories, meal2Calories),
+                    notes = null,
+                    emoji = originalAnalysis.emoji
+                )
+
+                val qty = _quantity.value
+                val mealDate = editingMealDate
+                    ?: targetDate
+                    ?: java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+
+                val mealIds = editingMealIds
+                val mealId = editingMealId
+                if (mealIds != null) {
+                    saveMealUseCase.splitAndSaveMultiple(mealIds, analysis1, analysis2, mealDate, qty)
+                } else {
+                    saveMealUseCase.splitAndSave(mealId, analysis1, analysis2, mealDate, qty)
+                }
+
+                _mealSaved.value = true
+                loadRecentEmojis()
+            } catch (e: Exception) {
+                _saveError.value = e.russianMessage()
+            }
+        }
+    }
+
+    fun viewMealDetail(meal: MealEntry) {
+        val ingredients = try {
+            val array = JSONArray(meal.ingredientsJson)
+            buildList {
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    add(Ingredient(
+                        name = obj.getString("name"),
+                        quantity = obj.getString("quantity"),
+                        calories = obj.getInt("calories"),
+                        healthRating = if (obj.has("healthRating") && !obj.isNull("healthRating")) obj.getString("healthRating") else null
+                    ))
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        val analysis = FoodAnalysis(
+            dishName = meal.dishName,
+            totalCalories = meal.calories,
+            ingredients = ingredients,
+            macros = Macros(
+                proteins = String.format("%.0f г", meal.proteins),
+                carbs = String.format("%.0f г", meal.carbs),
+                fats = String.format("%.0f г", meal.fats),
+                fiber = if (meal.fiber > 0) String.format("%.0f г", meal.fiber) else null
+            ),
+            notes = null,
+            emoji = meal.emoji
+        )
+        _uiState.value = AnalysisUiState.Success(analysis)
+        _mealSaved.value = false
+        _readOnly.value = false
+        _isFavorite.value = meal.isFavorite
+        _quantity.value = meal.quantity
+        editingMealId = meal.id
+        editingMealDate = meal.date
+        lastImageData = null
+    }
+
+    fun viewMergedMeals(meals: List<MealEntry>) {
+        val dishName = meals.joinToString(" + ") { it.dishName }
+        val totalCalories = meals.sumOf { it.calories * it.quantity }
+        val totalProteins = meals.sumOf { it.proteins.toDouble() * it.quantity }.toFloat()
+        val totalCarbs = meals.sumOf { it.carbs.toDouble() * it.quantity }.toFloat()
+        val totalFats = meals.sumOf { it.fats.toDouble() * it.quantity }.toFloat()
+        val totalFiber = meals.sumOf { it.fiber.toDouble() * it.quantity }.toFloat()
+
+        val allIngredients = meals.flatMap { meal ->
+            try {
+                val array = JSONArray(meal.ingredientsJson)
+                buildList {
+                    for (i in 0 until array.length()) {
+                        val obj = array.getJSONObject(i)
+                        add(Ingredient(
+                            name = obj.getString("name"),
+                            quantity = obj.getString("quantity"),
+                            calories = obj.getInt("calories"),
+                            healthRating = if (obj.has("healthRating") && !obj.isNull("healthRating")) obj.getString("healthRating") else null
+                        ))
+                    }
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        val emoji = meals.firstOrNull()?.emoji
+
+        val analysis = FoodAnalysis(
+            dishName = dishName,
+            totalCalories = totalCalories,
+            ingredients = allIngredients,
+            macros = Macros(
+                proteins = String.format("%.0f г", totalProteins),
+                carbs = String.format("%.0f г", totalCarbs),
+                fats = String.format("%.0f г", totalFats),
+                fiber = if (totalFiber > 0) String.format("%.0f г", totalFiber) else null
+            ),
+            notes = null,
+            emoji = emoji
+        )
+        _uiState.value = AnalysisUiState.Success(analysis)
+        _mealSaved.value = false
+        _readOnly.value = false
+        _isFavorite.value = false
+        _quantity.value = 1
+        editingMealIds = meals.map { it.id }
+        editingMealDate = meals.firstOrNull()?.date
+        lastImageData = null
+    }
+
+    fun removeIngredient(index: Int) {
+        val current = _uiState.value
+        if (current is AnalysisUiState.Success) {
+            val result = current.result
+            val oldTotalCalories = result.totalCalories
+            val newIngredients = result.ingredients.toMutableList().apply { removeAt(index) }
+            val newTotalCalories = newIngredients.sumOf { it.calories }
+            val updatedResult = result.copy(
+                ingredients = newIngredients,
+                totalCalories = newTotalCalories,
+                macros = scaleMacros(result.macros, oldTotalCalories, newTotalCalories)
+            )
+            _uiState.value = AnalysisUiState.Success(updatedResult)
+            if (_readOnly.value) persistMealUpdate(updatedResult)
+        }
+    }
+
+    fun updateIngredient(index: Int, newName: String, newQuantity: String, newCalories: Int) {
+        if (newName.isBlank() || !com.ghostwan.snapcal.domain.model.IngredientQuantity.isValid(newQuantity) || newCalories !in 0..100000) return
+        val current = _uiState.value
+        if (current is AnalysisUiState.Success) {
+            val result = current.result
+            if (index !in result.ingredients.indices) return
+            _mealSaved.value = false
+            val oldTotalCalories = result.totalCalories
+            val newIngredients = result.ingredients.toMutableList().apply {
+                set(index, get(index).copy(name = newName.trim(), quantity = newQuantity.trim(), calories = newCalories, healthRating = if (get(index).name == newName.trim()) get(index).healthRating else null))
+            }
+            val newTotalCalories = newIngredients.sumOf { it.calories }
+            val updatedResult = result.copy(
+                ingredients = newIngredients,
+                totalCalories = newTotalCalories,
+                macros = scaleMacros(result.macros, oldTotalCalories, newTotalCalories)
+            )
+            _uiState.value = AnalysisUiState.Success(updatedResult)
+            if (_readOnly.value) persistMealUpdate(updatedResult)
+        }
+    }
+
+    fun updateDishName(name: String) {
+        val current = _uiState.value
+        if (current is AnalysisUiState.Success) {
+            _uiState.value = AnalysisUiState.Success(current.result.copy(dishName = name))
+        }
+    }
+
+    fun updateEmoji(emoji: String) {
+        val current = _uiState.value
+        if (current is AnalysisUiState.Success) {
+            _uiState.value = AnalysisUiState.Success(current.result.copy(emoji = emoji))
+        }
+        val mealId = editingMealId ?: return
+        viewModelScope.launch {
+            mealRepository.updateEmoji(mealId, emoji)
+        }
+    }
+
+    fun updateQuantity(qty: Int) {
+        if (qty < 1) return
+        _quantity.value = qty
+        // Auto-save in readOnly mode (viewing a saved meal)
+        if (_readOnly.value) {
+            val mealId = editingMealId ?: return
+            viewModelScope.launch {
+                mealRepository.updateQuantity(mealId, qty)
+            }
+        }
+    }
+
+    fun toggleFavorite() {
+        val mealId = editingMealId ?: return
+        val newValue = !_isFavorite.value
+        _isFavorite.value = newValue
+        viewModelScope.launch {
+            mealRepository.setFavorite(mealId, newValue)
+        }
+    }
+
+    fun isEditing(): Boolean = editingMealId != null
+
+    fun resetMealSaved() {
+        _mealSaved.value = false
+    }
+
+    fun clearSaveError() {
+        _saveError.value = null
+    }
+
+    fun resetState() {
+        _uiState.value = AnalysisUiState.Idle
+        _mealSaved.value = false
+        _saveError.value = null
+        _scanRunningInBackground.value = false
+        _readOnly.value = false
+        _isFavorite.value = false
+        _quantity.value = 1
+        editingMealId = null
+        editingMealIds = null
+        editingMealDate = null
+        targetDate = null
+        lastImageData = null
+    }
+
+    private fun scaleMacros(macros: Macros?, oldCalories: Int, newCalories: Int): Macros? {
+        if (macros == null || oldCalories <= 0) return macros
+        val ratio = newCalories.toFloat() / oldCalories
+        return Macros(
+            proteins = scaleGramString(macros.proteins, ratio),
+            carbs = scaleGramString(macros.carbs, ratio),
+            fats = scaleGramString(macros.fats, ratio),
+            fiber = macros.fiber?.let { scaleGramString(it, ratio) }
+        )
+    }
+
+    private fun scaleGramString(value: String, ratio: Float): String {
+        val numeric = value.replace(Regex("[^0-9.,]"), "").replace(",", ".").toFloatOrNull()
+            ?: return value
+        return String.format("%.0f г", numeric * ratio)
+    }
+
+    private fun persistMealUpdate(result: FoodAnalysis) {
+        val mealId = editingMealId ?: return
+        viewModelScope.launch {
+            val proteins = parseGrams(result.macros?.proteins)
+            val carbs = parseGrams(result.macros?.carbs)
+            val fats = parseGrams(result.macros?.fats)
+            val fiber = parseGrams(result.macros?.fiber)
+            val ingredientsJson = buildIngredientsJson(result.ingredients)
+            mealRepository.updateMealNutrition(mealId, result.totalCalories, proteins, carbs, fats, fiber, ingredientsJson)
+        }
+    }
+
+    private fun parseGrams(value: String?): Float {
+        if (value == null) return 0f
+        return value.replace(Regex("[^0-9.,]"), "").replace(",", ".").toFloatOrNull() ?: 0f
+    }
+
+    private fun buildIngredientsJson(ingredients: List<Ingredient>): String = JSONArray().apply {
+        ingredients.forEach { ingredient ->
+            put(org.json.JSONObject().apply {
+                put("name", ingredient.name)
+                put("quantity", ingredient.quantity)
+                put("calories", ingredient.calories)
+                put("healthRating", ingredient.healthRating ?: org.json.JSONObject.NULL)
+            })
+        }
+    }.toString()
+
+    private fun readAndCompressImage(context: Context, uri: Uri): ByteArray {
+        val inputStream = context.contentResolver.openInputStream(uri)
+            ?: throw IllegalStateException("Не удалось прочитать фотографию")
+
+        val bitmap = inputStream.use { BitmapFactory.decodeStream(it) }
+            ?: throw IllegalStateException("Не удалось обработать фотографию")
+
+        val resized = resizeBitmap(bitmap, 1024)
+        val output = ByteArrayOutputStream()
+        resized.compress(Bitmap.CompressFormat.JPEG, 85, output)
+        return output.toByteArray()
+    }
+
+    private fun resizeBitmap(bitmap: Bitmap, maxSize: Int): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= maxSize && height <= maxSize) return bitmap
+
+        val ratio = width.toFloat() / height.toFloat()
+        val newWidth: Int
+        val newHeight: Int
+        if (width > height) {
+            newWidth = maxSize
+            newHeight = (maxSize / ratio).toInt()
+        } else {
+            newHeight = maxSize
+            newWidth = (maxSize * ratio).toInt()
+        }
+        return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+    }
+
+    private fun postScanFinishedNotification(context: Context, result: FoodAnalysis) {
+        if (!canPostNotifications(context)) return
+        // Stash this specific scan in the in-memory cache so the notification
+        // can later open exactly this result, even if a newer scan has finished
+        // in the meantime.
+        val scanId = PendingScansCache.newId()
+        PendingScansCache.put(scanId, result)
+
+        val intent = Intent(context, MainActivity::class.java).apply {
+            putExtra("navigate_to", "result")
+            putExtra("scan_id", scanId)
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        // Unique request code per scan so PendingIntents don't collide /
+        // overwrite each other's extras.
+        val requestCode = scanId.hashCode()
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(context, SnapCalApp.AI_INSIGHTS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(context.getString(R.string.scan_notification_done_title))
+            .setContentText(context.getString(R.string.scan_notification_done_text, result.dishName, result.totalCalories))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+        // Unique notification id per scan so notifications stack instead of
+        // replacing each other.
+        val notifId = SnapCalApp.NOTIFICATION_ID_SCAN_RESULT_BASE + (scanId.hashCode() and 0x0FFFFFFF)
+        try {
+            NotificationManagerCompat.from(context).notify(notifId, notification)
+        } catch (_: SecurityException) {
+            // Permission can be revoked between the check and the notification.
+        }
+    }
+
+    private fun postScanFailedNotification(context: Context) {
+        if (!canPostNotifications(context)) return
+        val intent = Intent(context, MainActivity::class.java).apply {
+            putExtra("navigate_to", "home")
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            3002,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(context, SnapCalApp.AI_INSIGHTS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(context.getString(R.string.scan_notification_failed_title))
+            .setContentText(context.getString(R.string.scan_notification_failed_text))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+        try {
+            NotificationManagerCompat.from(context).notify(SnapCalApp.NOTIFICATION_ID_SCAN_FAILED, notification)
+        } catch (_: SecurityException) {
+            // The result remains available in the app without notifications.
+        }
+    }
+
+    /**
+     * Loads a previously-completed background scan (stored in [PendingScansCache])
+     * into the ViewModel state, so the result screen can display exactly that
+     * scan when the user taps its notification.
+     */
+    fun showScanFromCache(scanId: String): Boolean {
+        val analysis = PendingScansCache.take(scanId) ?: return false
+        _uiState.value = AnalysisUiState.Success(analysis)
+        _mealSaved.value = false
+        _saveError.value = null
+        _scanRunningInBackground.value = false
+        _readOnly.value = false
+        _isFavorite.value = false
+        _quantity.value = 1
+        editingMealId = null
+        editingMealIds = null
+        editingMealDate = null
+        lastImageData = null
+        return true
+    }
+
+    private fun canPostNotifications(context: Context): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    companion object {
+        const val FREE_DAILY_LIMIT = 1500
+
+        fun provideFactory(
+            analyzeFoodUseCase: AnalyzeFoodUseCase,
+            correctAnalysisUseCase: CorrectAnalysisUseCase,
+            settingsRepository: SettingsRepository,
+            usageRepository: UsageRepository,
+            saveMealUseCase: SaveMealUseCase,
+            mealRepository: MealRepository
+        ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                return FoodAnalysisViewModel(
+                    analyzeFoodUseCase,
+                    correctAnalysisUseCase,
+                    settingsRepository,
+                    usageRepository,
+                    saveMealUseCase,
+                    mealRepository
+                ) as T
+            }
+        }
+    }
+}
