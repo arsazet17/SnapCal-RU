@@ -1,5 +1,7 @@
 # SnapCal RU v1.0
 
+[Скачать готовый APK для Android](https://github.com/arsazet17/SnapCal-RU/releases/download/v1.0/SnapCal-RU-v1.0.apk) · [Отчёт о сборке](BUILD-REPORT-RU.md)
+
 Русская версия исходного Android-приложения [ghostwan/food-calories](https://github.com/ghostwan/food-calories).
 Основа: commit `12409267166196efa3f18413b490550d5e8dbac1`.
 
